@@ -46,17 +46,28 @@ extension UInt8 {
     static let newline: UInt8 = 0x0a
 }
 
-func parseReading(from data: Data, index: inout Int) -> Measurement? {
-    let slice = data[index...]
-    guard let semiIndex = slice.firstIndex(of: .semi),
-        let newLineIndex = slice.firstIndex(of: .newline) else {
-            return nil
-        }
+func parseReading(from pointer: UnsafeRawBufferPointer, offset: inout Int) -> Measurement? {
+    let base = UnsafeMutableRawPointer(mutating: pointer.baseAddress! + offset)
+    let maxSearch = pointer.count - offset
+    guard let semiPtr = memchr(base, Int32(UInt8.semi), maxSearch) else { return nil }
 
-    let name = String(data: slice[index..<semiIndex], encoding: .utf8)!
-    let tempStr = String(data: slice[(semiIndex + 1)..<newLineIndex], encoding: .utf8)!
+    let cityNameCount = base.distance(to: semiPtr)
+    let bytesAfterSemicolon = pointer.count - offset - cityNameCount - 1
+
+    guard let newLinePtr = memchr(semiPtr + 1, Int32(UInt8.newline), bytesAfterSemicolon) else { return nil }
+    let temperatureCount = (semiPtr + 1).distance(to: newLinePtr)
+
+    let nameBuffer = UnsafeRawBufferPointer(start: base, count: cityNameCount)
+    let nameData = Data(buffer: nameBuffer.assumingMemoryBound(to: UInt8.self))
+    let name = String(data: nameData, encoding: .utf8)!
+
+    let tempBuffer = UnsafeRawBufferPointer(start: semiPtr + 1, count: temperatureCount)
+    let tempData = Data(buffer: tempBuffer.assumingMemoryBound(to: UInt8.self))
+    let tempStr = String(data: tempData, encoding: .utf8)!
     let temp = Double(tempStr)!
-    index = newLineIndex + 1
+
+    offset += cityNameCount + 1 + temperatureCount + 1 // account for delimiters
+
     return Measurement(name: name, temperature: temp)
 }
 
@@ -68,14 +79,16 @@ func run(inputFile: String) throws {
     print("Loaded \(fmt.string(fromByteCount: Int64(data.count)))", to: &stderr)
 
     var results = [String: Entry]()
-    var index = 0
+    var offset = 0
     var count = 0
 
-    while let reading = parseReading(from: data, index: &index) {
-        count += 1
+    data.withUnsafeBytes { bufferPointer in
+        while let reading = parseReading(from: bufferPointer, offset: &offset) {
+            count += 1
             var entry = results[reading.name] ?? Entry()
             entry.update(from: reading)
             results[reading.name] = entry
+        }
     }
 
     let nf = NumberFormatter()
