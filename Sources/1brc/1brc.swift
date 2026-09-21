@@ -1,19 +1,36 @@
 import Foundation
 
 struct Measurement {
-    let name: String
+    let cityKey: CityKey
     let temperature: Double
 }
 
+struct CityKey: Hashable {
+    let buffer: UnsafeRawBufferPointer
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(bytes: buffer)
+    }
+
+    func decodeName() -> String {
+        let nameData = Data(buffer: buffer.assumingMemoryBound(to: UInt8.self))
+        return String(data: nameData, encoding: .utf8)!
+    }
+
+    static func == (lhs: CityKey, rhs: CityKey) -> Bool {
+        return lhs.buffer.count == rhs.buffer.count && memcmp(lhs.buffer.baseAddress, rhs.buffer.baseAddress, lhs.buffer.count) == 0
+    }
+}
+
 struct Entry {
-    var name: String = ""
+    var cityKey: CityKey?
     var min: Double = 0
     var max: Double = 0
     var sum: Double = 0
     var count: Int = 0
 
     mutating func update(from measurement: Measurement) {
-        name = measurement.name
+        cityKey = measurement.cityKey
 
         if count == 0 {
             min = measurement.temperature
@@ -33,7 +50,7 @@ struct Entry {
 }
 
 extension Entry {
-    func formatted(using nf: NumberFormatter) -> String {
+    func formatted(name: String, using nf: NumberFormatter) -> String {
         let min = nf.string(from: self.min as NSNumber)!
         let max = nf.string(from: self.max as NSNumber)!
         let avg = nf.string(from: self.avg as NSNumber)!
@@ -58,8 +75,6 @@ func parseReading(from pointer: UnsafeRawBufferPointer, offset: inout Int) -> Me
     let temperatureCount = (semiPtr + 1).distance(to: newLinePtr)
 
     let nameBuffer = UnsafeRawBufferPointer(start: base, count: cityNameCount)
-    let nameData = Data(buffer: nameBuffer.assumingMemoryBound(to: UInt8.self))
-    let name = String(data: nameData, encoding: .utf8)!
 
     let tempBuffer = UnsafeRawBufferPointer(start: semiPtr + 1, count: temperatureCount)
     let tempData = Data(buffer: tempBuffer.assumingMemoryBound(to: UInt8.self))
@@ -68,7 +83,7 @@ func parseReading(from pointer: UnsafeRawBufferPointer, offset: inout Int) -> Me
 
     offset += cityNameCount + 1 + temperatureCount + 1 // account for delimiters
 
-    return Measurement(name: name, temperature: temp)
+    return Measurement(cityKey: CityKey(buffer: nameBuffer), temperature: temp)
 }
 
 func run(inputFile: String) throws {
@@ -78,24 +93,28 @@ func run(inputFile: String) throws {
     var stderr = StandardErrorStream()
     print("Loaded \(fmt.string(fromByteCount: Int64(data.count)))", to: &stderr)
 
-    var results = [String: Entry]()
+    var results = [CityKey: Entry]()
     var offset = 0
     var count = 0
 
     data.withUnsafeBytes { bufferPointer in
         while let reading = parseReading(from: bufferPointer, offset: &offset) {
             count += 1
-            var entry = results[reading.name] ?? Entry()
+            var entry = results[reading.cityKey] ?? Entry()
             entry.update(from: reading)
-            results[reading.name] = entry
+            results[reading.cityKey] = entry
         }
-    }
 
-    let nf = NumberFormatter()
-    nf.minimumFractionDigits = 1
-    nf.maximumFractionDigits = 1
-    for key in results.keys.sorted() {
-        print(results[key]!.formatted(using: nf))
+        let nf = NumberFormatter()
+        nf.minimumFractionDigits = 1
+        nf.maximumFractionDigits = 1
+        let entries = results.keys.reduce(into: [String: Entry]()) { partialResult, cityKey in
+            let name = cityKey.decodeName()
+            partialResult[name] = results[cityKey]!
+        }
+        for key in entries.keys.sorted() {
+            print(entries[key]!.formatted(name: key, using: nf))
+        }
     }
 }
 
