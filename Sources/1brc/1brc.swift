@@ -2,7 +2,35 @@ import Foundation
 
 struct Measurement {
     let cityKey: CityKey
-    let temperature: Double
+    let temperature: Temperature
+}
+
+struct Temperature: ExpressibleByIntegerLiteral, Comparable {
+    let tenths: Int
+
+    init(integerLiteral value: IntegerLiteralType) {
+        tenths = value
+    }
+
+    init(tenths: Int) {
+        self.tenths = tenths
+    }
+
+    var doubleValue: Double {
+        Double(tenths) / 10
+    }
+
+    static func + (lhs: Temperature, rhs: Temperature) -> Temperature {
+        Temperature(tenths: lhs.tenths + rhs.tenths)
+    }
+
+    static func += (lhs: inout Temperature, rhs: Temperature) {
+        lhs = Temperature(tenths: lhs.tenths + rhs.tenths)
+    }
+
+    static func < (lhs: Temperature, rhs: Temperature) -> Bool {
+        lhs.tenths < rhs.tenths
+    }
 }
 
 struct CityKey: Hashable {
@@ -24,9 +52,9 @@ struct CityKey: Hashable {
 
 struct Entry {
     var cityKey: CityKey?
-    var min: Double = 0
-    var max: Double = 0
-    var sum: Double = 0
+    var min: Temperature = 0
+    var max: Temperature = 0
+    var sum: Temperature = 0
     var count: Int = 0
 
     mutating func update(from measurement: Measurement) {
@@ -45,14 +73,14 @@ struct Entry {
     }
 
     var avg: Double {
-        sum / Double(count)
+        sum.doubleValue / Double(count)
     }
 }
 
 extension Entry {
     func formatted(name: String, using nf: NumberFormatter) -> String {
-        let min = nf.string(from: self.min as NSNumber)!
-        let max = nf.string(from: self.max as NSNumber)!
+        let min = nf.string(from: self.min.doubleValue as NSNumber)!
+        let max = nf.string(from: self.max.doubleValue as NSNumber)!
         let avg = nf.string(from: self.avg as NSNumber)!
         return "\(name)=\(min)/\(max)/\(avg)"
     }
@@ -61,6 +89,9 @@ extension Entry {
 extension UInt8 {
     static let semi: UInt8 = 0x3b
     static let newline: UInt8 = 0x0a
+    static let minusSign: UInt8 = 0x2d
+    static let period: UInt8 = 0x2e
+    static let zero: UInt8 = 0x30
 }
 
 func parseReading(from pointer: UnsafeRawBufferPointer, offset: inout Int) -> Measurement? {
@@ -77,13 +108,36 @@ func parseReading(from pointer: UnsafeRawBufferPointer, offset: inout Int) -> Me
     let nameBuffer = UnsafeRawBufferPointer(start: base, count: cityNameCount)
 
     let tempBuffer = UnsafeRawBufferPointer(start: semiPtr + 1, count: temperatureCount)
-    let tempData = Data(buffer: tempBuffer.assumingMemoryBound(to: UInt8.self))
-    let tempStr = String(data: tempData, encoding: .utf8)!
-    let temp = Double(tempStr)!
+    let temp = parseTemperature(buffer: tempBuffer)
 
-    offset += cityNameCount + 1 + temperatureCount + 1 // account for delimiters
+    offset += cityNameCount + 1 + tempBuffer.count + 1 // account for delimiters
 
     return Measurement(cityKey: CityKey(buffer: nameBuffer), temperature: temp)
+}
+
+func parseTemperature(buffer: UnsafeRawBufferPointer) -> Temperature {
+    let buffer = buffer.assumingMemoryBound(to: UInt8.self)
+    let ptr = buffer.baseAddress!
+    var sum = 0
+    var pos = 0
+    let isNegative = ptr[0] == UInt8.minusSign
+    if isNegative {
+        pos += 1
+    }
+
+    while pos < buffer.count {
+        sum *= 10
+        if ptr[pos] == .period {
+            pos += 1
+        }
+
+        let value = ptr[pos] - .zero
+        sum += Int(value)
+        pos += 1
+    }
+
+    let tenths = (isNegative ? -1 : 1) * sum
+    return Temperature(tenths: tenths)
 }
 
 func run(inputFile: String) throws {
