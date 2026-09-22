@@ -100,9 +100,7 @@ func run(inputFile: String) throws {
     data.withUnsafeBytes { bufferPointer in
         while let reading = parseReading(from: bufferPointer, offset: &offset) {
             count += 1
-            var entry = results[reading.cityKey] ?? Entry()
-            entry.update(from: reading)
-            results[reading.cityKey] = entry
+            results[reading.cityKey, default: Entry()].update(from: reading)
         }
 
         let nf = NumberFormatter()
