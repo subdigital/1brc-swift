@@ -140,33 +140,59 @@ func parseTemperature(buffer: UnsafeRawBufferPointer) -> Temperature {
     return Temperature(tenths: tenths)
 }
 
+struct MappedFile: ~Copyable {
+    let ptr: UnsafeMutableRawPointer
+    let size: Int
+    let fd: Int32
+
+    init(path: String) {
+        fd = open(path, O_RDONLY)
+        precondition(fd >= 0, "open failed: \(errno)")
+
+        var status = stat()
+        precondition(fstat(fd, &status) == 0, "fstat failed: \(errno)")
+        size = Int(status.st_size)
+
+        ptr = mmap(nil, size, PROT_READ, MAP_PRIVATE, fd, 0)!
+    }
+
+    deinit {
+        munmap(ptr, size)
+        close(fd)
+    }
+
+    var bufferPointer: UnsafeRawBufferPointer {
+        UnsafeRawBufferPointer(start: ptr, count: size)
+    }
+}
+
 func run(inputFile: String) throws {
     let fileURL = URL(fileURLWithPath: inputFile)
-    let data = try Data(contentsOf: fileURL)
+
+    let file = MappedFile(path: fileURL.path())
     let fmt = ByteCountFormatter()
     var stderr = StandardErrorStream()
-    print("Loaded \(fmt.string(fromByteCount: Int64(data.count)))", to: &stderr)
+    print("Loaded \(fmt.string(fromByteCount: Int64(file.size)))", to: &stderr)
 
     var results = [CityKey: Entry]()
     var offset = 0
     var count = 0
 
-    data.withUnsafeBytes { bufferPointer in
-        while let reading = parseReading(from: bufferPointer, offset: &offset) {
-            count += 1
-            results[reading.cityKey, default: Entry()].update(from: reading)
-        }
+    let bufferPointer = file.bufferPointer
+    while let reading = parseReading(from: bufferPointer, offset: &offset) {
+        count += 1
+        results[reading.cityKey, default: Entry()].update(from: reading)
+    }
 
-        let nf = NumberFormatter()
-        nf.minimumFractionDigits = 1
-        nf.maximumFractionDigits = 1
-        let entries = results.keys.reduce(into: [String: Entry]()) { partialResult, cityKey in
-            let name = cityKey.decodeName()
-            partialResult[name] = results[cityKey]!
-        }
-        for key in entries.keys.sorted() {
-            print(entries[key]!.formatted(name: key, using: nf))
-        }
+    let nf = NumberFormatter()
+    nf.minimumFractionDigits = 1
+    nf.maximumFractionDigits = 1
+    let entries = results.keys.reduce(into: [String: Entry]()) { partialResult, cityKey in
+        let name = cityKey.decodeName()
+        partialResult[name] = results[cityKey]!
+    }
+    for key in entries.keys.sorted() {
+        print(entries[key]!.formatted(name: key, using: nf))
     }
 }
 
