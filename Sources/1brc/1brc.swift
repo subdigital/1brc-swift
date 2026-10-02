@@ -94,6 +94,7 @@ extension UInt8 {
     static let zero: UInt8 = 0x30
 }
 
+@inline(__always)
 func fastFind(from pointer: UnsafeRawPointer, target: UInt8, maxSearch: Int) -> (UnsafeRawPointer, Int)? {
     guard let targetPointerMut = memchr(pointer, Int32(target), maxSearch) else {
         return nil
