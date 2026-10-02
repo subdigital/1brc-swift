@@ -94,23 +94,23 @@ extension UInt8 {
     static let zero: UInt8 = 0x30
 }
 
-func parseReading(from pointer: UnsafeRawBufferPointer, offset: inout Int) -> Measurement? {
-    let base = UnsafeMutableRawPointer(mutating: pointer.baseAddress! + offset)
-    let maxSearch = pointer.count - offset
-    guard let semiPtr = memchr(base, Int32(UInt8.semi), maxSearch) else { return nil }
+func parseReading(from buffer: UnsafeRawBufferPointer, offset: inout Int) -> Measurement? {
+    let ptr = buffer.baseAddress! + offset
+    let maxSearch = buffer.count - offset
+    guard let semiPtr = memchr(ptr, Int32(UInt8.semi), maxSearch) else { return nil }
 
-    let cityNameCount = base.distance(to: semiPtr)
-    let bytesAfterSemicolon = pointer.count - offset - cityNameCount - 1
+    let stationSize = ptr.distance(to: semiPtr)
+    let bytesAfterSemicolon = maxSearch - stationSize - 1
 
     guard let newLinePtr = memchr(semiPtr + 1, Int32(UInt8.newline), bytesAfterSemicolon) else { return nil }
     let temperatureCount = (semiPtr + 1).distance(to: newLinePtr)
 
-    let nameBuffer = UnsafeRawBufferPointer(start: base, count: cityNameCount)
+    let nameBuffer = UnsafeRawBufferPointer(start: ptr, count: stationSize)
 
     let tempBuffer = UnsafeRawBufferPointer(start: semiPtr + 1, count: temperatureCount)
     let temp = parseTemperature(buffer: tempBuffer)
 
-    offset += cityNameCount + 1 + tempBuffer.count + 1 // account for delimiters
+    offset += stationSize + 1 + tempBuffer.count + 1 // account for delimiters
 
     return Measurement(cityKey: CityKey(buffer: nameBuffer), temperature: temp)
 }
