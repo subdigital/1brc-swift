@@ -94,20 +94,39 @@ extension UInt8 {
     static let zero: UInt8 = 0x30
 }
 
+func fastFind(from pointer: UnsafeRawPointer, target: UInt8, maxSearch: Int) -> (UnsafeRawPointer, Int)? {
+    guard let targetPointerMut = memchr(pointer, Int32(target), maxSearch) else {
+        return nil
+    }
+
+    let targetPtr = UnsafeRawPointer(targetPointerMut)
+    return (targetPtr, pointer.distance(to: targetPtr))
+}
+
 func parseReading(from buffer: UnsafeRawBufferPointer, offset: inout Int) -> Measurement? {
     let ptr = buffer.baseAddress! + offset
-    let maxSearch = buffer.count - offset
-    guard let semiPtr = memchr(ptr, Int32(UInt8.semi), maxSearch) else { return nil }
+    var maxSearch = buffer.count - offset
 
-    let stationSize = ptr.distance(to: semiPtr)
-    let bytesAfterSemicolon = maxSearch - stationSize - 1
+    guard let (semiPtr, stationSize) = fastFind(
+        from: ptr,
+        target: .semi,
+        maxSearch: maxSearch
+    ) else {
+        return nil
+    }
 
-    guard let newLinePtr = memchr(semiPtr + 1, Int32(UInt8.newline), bytesAfterSemicolon) else { return nil }
-    let temperatureCount = (semiPtr + 1).distance(to: newLinePtr)
+    maxSearch -= stationSize + 1
+    guard let (_, temperatureSize) = fastFind(
+        from: semiPtr + 1,
+        target: .newline,
+        maxSearch: maxSearch
+    ) else {
+        return nil
+    }
 
     let nameBuffer = UnsafeRawBufferPointer(start: ptr, count: stationSize)
 
-    let tempBuffer = UnsafeRawBufferPointer(start: semiPtr + 1, count: temperatureCount)
+    let tempBuffer = UnsafeRawBufferPointer(start: semiPtr + 1, count: temperatureSize)
     let temp = parseTemperature(buffer: tempBuffer)
 
     offset += stationSize + 1 + tempBuffer.count + 1 // account for delimiters
