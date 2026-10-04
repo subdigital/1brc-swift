@@ -2,10 +2,76 @@ import Foundation
 
 typealias Results = [CityKey: Entry]
 
-struct Measurement: Sendable {
-    let cityKey: CityKey
-    let temperature: Temperature
+struct Slot {
+    var keyptr: UnsafeRawBufferPointer?
+    var hash: UInt64 = 0
+    var entry = Entry()
 }
+
+struct StationTable: ~Copyable {
+    static let capacity = 1 << 14  // 16,384
+    static let mask = capacity - 1
+    private var slots: UnsafeMutablePointer<Slot>
+    private(set) var count = 0
+
+    init() {
+        slots = .allocate(capacity: Self.capacity)
+        slots.initialize(repeating: Slot(), count: Self.capacity)
+    }
+
+    deinit {
+        slots.deallocate()
+    }
+
+    mutating func add(
+        cityPointer: UnsafeRawBufferPointer,
+        hash: UInt64,
+        temperature: Temperature
+    ) {
+        var index = Int(truncatingIfNeeded: hash) & Self.mask
+
+        while true {
+            let slot = self.slots + index
+            if slot.pointee.keyptr == nil {
+                // empty slot
+                var entry = Entry()
+                entry.update(from: temperature)
+                slot.pointee = Slot(
+                    keyptr: cityPointer,
+                    hash: hash,
+                    entry: entry
+                )
+                return
+            } else {
+                // is it the same city?
+                if slot.pointee.hash == hash &&
+                   slot.pointee.keyptr!.count == cityPointer.count &&
+                    memcmp(slot.pointee.keyptr!.baseAddress, cityPointer.baseAddress, cityPointer.count) == 0
+                {
+                    // same, merge
+                    slot.pointee.entry.update(from: temperature)
+                    return
+                }
+
+                // collision, linear probe next slot
+                index = (index + 1) & Self.mask
+            }
+        }
+    }
+
+    func makeResults() -> Results {
+        var results = Results()
+        for i in 0..<Self.capacity {
+            let slot = (self.slots + i).pointee
+            guard let keyptr = slot.keyptr else { continue }
+
+            let key = CityKey(buffer: keyptr)
+            results[key] = slot.entry
+        }
+        return results
+    }
+}
+
 
 struct Temperature: ExpressibleByIntegerLiteral, Comparable, Sendable {
     let tenths: Int
@@ -35,8 +101,6 @@ struct Temperature: ExpressibleByIntegerLiteral, Comparable, Sendable {
     }
 }
 
-// Safety invariant: the mapped bytes are immutable and every key is consumed before
-// its owning MappedFile leaves scope.
 struct CityKey: Hashable, @unchecked Sendable {
     let buffer: UnsafeRawBufferPointer
 
@@ -55,24 +119,21 @@ struct CityKey: Hashable, @unchecked Sendable {
 }
 
 struct Entry: Sendable {
-    var cityKey: CityKey?
     var min: Temperature = 0
     var max: Temperature = 0
     var sum: Temperature = 0
     var count: Int = 0
 
-    mutating func update(from measurement: Measurement) {
-        cityKey = measurement.cityKey
-
+    mutating func update(from temperature: Temperature) {
         if count == 0 {
-            min = measurement.temperature
-            max = measurement.temperature
+            min = temperature
+            max = temperature
         } else {
-            min = Swift.min(min, measurement.temperature)
-            max = Swift.max(max, measurement.temperature)
+            min = Swift.min(min, temperature)
+            max = Swift.max(max, temperature)
         }
 
-        sum += measurement.temperature
+        sum += temperature
         count += 1
     }
 
@@ -158,7 +219,7 @@ func chunkRanges(in file: borrowing MappedFile, count: Int) -> [Range<Int>] {
     return ranges
 }
 
-func parseReading(from buffer: UnsafeRawBufferPointer, offset: inout Int) -> Measurement? {
+func parseReading(from buffer: UnsafeRawBufferPointer, offset: inout Int, using table: inout StationTable) -> Bool {
     let ptr = buffer.baseAddress! + offset
     var maxSearch = buffer.count - offset
 
@@ -167,7 +228,7 @@ func parseReading(from buffer: UnsafeRawBufferPointer, offset: inout Int) -> Mea
         target: .semi,
         maxSearch: maxSearch
     ) else {
-        return nil
+        return false
     }
 
     maxSearch -= stationSize + 1
@@ -176,7 +237,7 @@ func parseReading(from buffer: UnsafeRawBufferPointer, offset: inout Int) -> Mea
         target: .newline,
         maxSearch: maxSearch
     ) else {
-        return nil
+        return false
     }
 
     let nameBuffer = UnsafeRawBufferPointer(start: ptr, count: stationSize)
@@ -186,7 +247,10 @@ func parseReading(from buffer: UnsafeRawBufferPointer, offset: inout Int) -> Mea
 
     offset += stationSize + 1 + tempBuffer.count + 1 // account for delimiters
 
-    return Measurement(cityKey: CityKey(buffer: nameBuffer), temperature: temp)
+    let hash = fnvHash(nameBuffer.baseAddress!.assumingMemoryBound(to: UInt8.self), count: nameBuffer.count)
+    table.add(cityPointer: nameBuffer, hash: hash, temperature: temp)
+
+    return true
 }
 
 func parseTemperature(buffer: UnsafeRawBufferPointer) -> Temperature {
@@ -260,18 +324,19 @@ func processResults(in file: borrowing MappedFile, ranges: [Range<Int>]) async -
 }
 
 private func processRange(in buffer: UnsafeRawBufferPointer, range: Range<Int>) -> Results {
-    let buffer = UnsafeRawBufferPointer(
+    let subBuffer = UnsafeRawBufferPointer(
         start: buffer.baseAddress! + range.lowerBound,
         count: range.count
     )
-    var results: Results = [:]
     var offset = 0
-
-    while let reading = parseReading(from: buffer, offset: &offset) {
-        results[reading.cityKey, default: Entry()].update(from: reading)
+    var table = StationTable()
+    while offset < subBuffer.count {
+        if !parseReading(from: subBuffer, offset: &offset, using: &table) {
+            break
+        }
     }
 
-    return results
+    return table.makeResults()
 }
 
 func run(inputFile: String) async throws {
@@ -313,4 +378,18 @@ struct brc {
         let inputFile = ProcessInfo.processInfo.environment["INPUT_FILE"] ?? "measurements.txt"
         try await run(inputFile: inputFile)
     }
+}
+
+// https://en.wikipedia.org/wiki/Fowler–Noll–Vo_hash_function
+func fnvHash(_ pointer: UnsafePointer<UInt8>, count: Int) -> UInt64 {
+    let FNVPrime: UInt64 = 1099511628211
+    let FNVOffsetBasis: UInt64 = 14695981039346656037
+
+    var hash: UInt64 = FNVOffsetBasis
+
+    for i in 0..<count {
+        hash = (hash ^ UInt64(pointer[i])) &* FNVPrime
+    }
+
+    return hash
 }
