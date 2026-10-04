@@ -1,11 +1,13 @@
 import Foundation
 
-struct Measurement {
+typealias Results = [CityKey: Entry]
+
+struct Measurement: Sendable {
     let cityKey: CityKey
     let temperature: Temperature
 }
 
-struct Temperature: ExpressibleByIntegerLiteral, Comparable {
+struct Temperature: ExpressibleByIntegerLiteral, Comparable, Sendable {
     let tenths: Int
 
     init(integerLiteral value: IntegerLiteralType) {
@@ -33,7 +35,9 @@ struct Temperature: ExpressibleByIntegerLiteral, Comparable {
     }
 }
 
-struct CityKey: Hashable {
+// Safety invariant: the mapped bytes are immutable and every key is consumed before
+// its owning MappedFile leaves scope.
+struct CityKey: Hashable, @unchecked Sendable {
     let buffer: UnsafeRawBufferPointer
 
     func hash(into hasher: inout Hasher) {
@@ -50,7 +54,7 @@ struct CityKey: Hashable {
     }
 }
 
-struct Entry {
+struct Entry: Sendable {
     var cityKey: CityKey?
     var min: Temperature = 0
     var max: Temperature = 0
@@ -72,17 +76,36 @@ struct Entry {
         count += 1
     }
 
+    mutating func merge(_ other: Entry) {
+        guard other.count > 0 else { return }
+
+        if count == 0 {
+            self = other
+            return
+        }
+
+        min = Swift.min(min, other.min)
+        max = Swift.max(max, other.max)
+        sum += other.sum
+        count += other.count
+    }
+
     var avg: Double {
         sum.doubleValue / Double(count)
     }
 }
 
 extension Entry {
-    func formatted(name: String, using nf: NumberFormatter) -> String {
-        let min = nf.string(from: self.min.doubleValue as NSNumber)!
-        let max = nf.string(from: self.max.doubleValue as NSNumber)!
-        let avg = nf.string(from: self.avg as NSNumber)!
-        return "\(name)=\(min)/\(max)/\(avg)"
+    func formatted(name: String, using formatter: NumberFormatter) -> String {
+        let minimum = format(min.doubleValue, using: formatter)
+        let maximum = format(max.doubleValue, using: formatter)
+        let average = format(avg, using: formatter)
+        return "\(name)=\(minimum)/\(maximum)/\(average)"
+    }
+
+    private func format(_ value: Double, using formatter: NumberFormatter) -> String {
+        let formattedValue = formatter.string(from: value as NSNumber)!
+        return formattedValue == "-0.0" ? "0.0" : formattedValue
     }
 }
 
@@ -102,6 +125,37 @@ func fastFind(from pointer: UnsafeRawPointer, target: UInt8, maxSearch: Int) -> 
 
     let targetPtr = UnsafeRawPointer(targetPointerMut)
     return (targetPtr, pointer.distance(to: targetPtr))
+}
+
+func chunkRanges(in file: borrowing MappedFile, count: Int) -> [Range<Int>] {
+    guard file.size > 0, count > 0 else { return [] }
+
+    let targetSize = file.size / count
+    var ranges: [Range<Int>] = []
+    var start = 0
+
+    for index in 1..<count {
+        let target = index * targetSize
+        guard target > start else { continue }
+
+        guard let (_, distance) = fastFind(
+            from: file.ptr + target,
+            target: .newline,
+            maxSearch: file.size - target
+        ) else {
+            break
+        }
+
+        let end = target + distance + 1
+        ranges.append(start..<end)
+        start = end
+    }
+
+    if start < file.size {
+        ranges.append(start..<file.size)
+    }
+
+    return ranges
 }
 
 func parseReading(from buffer: UnsafeRawBufferPointer, offset: inout Int) -> Measurement? {
@@ -186,7 +240,41 @@ struct MappedFile: ~Copyable {
     }
 }
 
-func run(inputFile: String) throws {
+func processResults(in file: borrowing MappedFile, ranges: [Range<Int>]) async -> Results {
+    nonisolated(unsafe) let buffer = file.bufferPointer
+    return await withTaskGroup(of: Results.self, returning: Results.self) { group in
+        for range in ranges {
+            group.addTask {
+                processRange(in: buffer, range: range)
+            }
+        }
+
+        var results: Results = [:]
+        for await partialResults in group {
+            for (cityKey, entry) in partialResults {
+                results[cityKey, default: Entry()].merge(entry)
+            }
+        }
+        return results
+    }
+}
+
+private func processRange(in buffer: UnsafeRawBufferPointer, range: Range<Int>) -> Results {
+    let buffer = UnsafeRawBufferPointer(
+        start: buffer.baseAddress! + range.lowerBound,
+        count: range.count
+    )
+    var results: Results = [:]
+    var offset = 0
+
+    while let reading = parseReading(from: buffer, offset: &offset) {
+        results[reading.cityKey, default: Entry()].update(from: reading)
+    }
+
+    return results
+}
+
+func run(inputFile: String) async throws {
     let fileURL = URL(fileURLWithPath: inputFile)
 
     let file = MappedFile(path: fileURL.path())
@@ -194,15 +282,11 @@ func run(inputFile: String) throws {
     var stderr = StandardErrorStream()
     print("Loaded \(fmt.string(fromByteCount: Int64(file.size)))", to: &stderr)
 
-    var results = [CityKey: Entry]()
-    var offset = 0
-    var count = 0
-
-    let bufferPointer = file.bufferPointer
-    while let reading = parseReading(from: bufferPointer, offset: &offset) {
-        count += 1
-        results[reading.cityKey, default: Entry()].update(from: reading)
-    }
+    let ranges = chunkRanges(
+        in: file,
+        count: ProcessInfo.processInfo.activeProcessorCount
+    )
+    let results = await processResults(in: file, ranges: ranges)
 
     let nf = NumberFormatter()
     nf.minimumFractionDigits = 1
@@ -225,8 +309,8 @@ struct StandardErrorStream: TextOutputStream {
 
 @main
 struct brc {
-    static func main() throws {
+    static func main() async throws {
         let inputFile = ProcessInfo.processInfo.environment["INPUT_FILE"] ?? "measurements.txt"
-        try run(inputFile: inputFile)
+        try await run(inputFile: inputFile)
     }
 }
